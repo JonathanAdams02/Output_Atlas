@@ -29,10 +29,20 @@ INSTITUTION_ID = None
 OUT_PATH = Path(__file__).resolve().parent / "atlas.html"
 
 EMBED_MODEL      = "all-MiniLM-L6-v2"
-MIN_CLUSTER_SIZE = 25
+MIN_CLUSTER_SIZE = 15   # now actually wired into HDBSCAN below — lower = more, smaller clusters
 RANDOM_STATE     = 42
 
-CLUSTER_COLORS = ['#c2613f','#c0902e','#5a9e57','#2f9ea0','#3f74c0','#7b6bcf','#b057a8','#b8506b']
+# NOTE: this is the single source of truth for cluster colors — it gets
+# injected into the HTML template at build time (see write_atlas()).
+# Previously there was a *second*, hardcoded copy of this list inside the
+# JS template that actually controlled rendering, so editing this list did
+# nothing. That's fixed now: the JS reads __CLUSTER_COLORS__ instead.
+CLUSTER_COLORS = [
+    '#c2613f', '#c0902e', '#5a9e57', '#2f9ea0',
+    '#3f74c0', '#7b6bcf', '#b057a8', '#b8506b',
+    '#d97b4f', '#8a9e3f', '#3f9e7a', '#4f8fc0',
+    '#9a5fc0', '#c05f8f', '#6b7b3f', '#3f6b9e',
+]
 
 # Filled during normalize() — only the display names of the PIs
 PI_AUTHOR_NAMES = set()
@@ -222,7 +232,7 @@ select{width:100%;padding:9px 11px;border:1px solid #e0e0db;border-radius:8px;fo
 const PAPERS_RAW = __PAPERS_DATA__;
 const PI_AUTHORS = __PI_AUTHORS__;
 
-const COLORS = ['#c2613f','#c0902e','#5a9e57','#2f9ea0','#3f74c0','#7b6bcf','#b057a8','#b8506b'];
+const COLORS = __CLUSTER_COLORS__;
 const NOISE_COLOR = '#9a9a93';
 
 function hexRgb(h){
@@ -692,7 +702,7 @@ def normalize(works):
             aid = (a["author"].get("id") or "").split("/")[-1].upper()
             if aid in pi_ids_upper:
                 PI_AUTHOR_NAMES.add(a["author"]["display_name"])
-        
+
         if not out:  # print first paper's raw keywords to inspect
             print("keywords sample:", w.get("keywords", [])[:3])
             print("topics sample:",   w.get("topics",   [])[:3])
@@ -737,16 +747,19 @@ def build(papers):
         random_state=RANDOM_STATE
     ).fit_transform(vecs)
 
-    print("Clustering with HDBSCAN…")
+    print(f"Clustering with HDBSCAN (min_cluster_size={MIN_CLUSTER_SIZE})…")
     labels = hdbscan.HDBSCAN(
-        min_cluster_size=20,       # was 5 — lower = more, smaller clusters
-        min_samples=2,            # reduces noise points
-        cluster_selection_method="leaf"  # finer-grained clusters
+        min_cluster_size=MIN_CLUSTER_SIZE,  # lower = more, smaller clusters
+        min_samples=2,                      # reduces noise points
+        cluster_selection_method="leaf"     # finer-grained clusters
     ).fit_predict(vecs_cluster)
 
     n_clusters = len(set(labels)) - (1 if -1 in labels else 0)
     n_noise    = (labels == -1).sum()
     print(f"  {n_clusters} clusters, {n_noise} noise points")
+    if n_clusters > len(CLUSTER_COLORS):
+        print(f"  NOTE: {n_clusters} clusters but only {len(CLUSTER_COLORS)} colors defined — "
+              f"colors will repeat (cluster id % {len(CLUSTER_COLORS)}). Add more to CLUSTER_COLORS if you want every cluster visually distinct.")
 
     names = label_clusters(texts, labels, papers)
 
@@ -879,10 +892,11 @@ def label_clusters(texts, labels, papers):
 # ── WRITE ─────────────────────────────────────────────────────────────────────
 def write_atlas(papers, three_js, orbit_js):
     html = HTML
-    html = html.replace("__THREE_JS__",    three_js)
-    html = html.replace("__ORBIT_JS__",    orbit_js)
-    html = html.replace("__PAPERS_DATA__", json.dumps(papers, ensure_ascii=False))
-    html = html.replace("__PI_AUTHORS__",  json.dumps(sorted(PI_AUTHOR_NAMES), ensure_ascii=False))
+    html = html.replace("__THREE_JS__",       three_js)
+    html = html.replace("__ORBIT_JS__",       orbit_js)
+    html = html.replace("__PAPERS_DATA__",    json.dumps(papers, ensure_ascii=False))
+    html = html.replace("__PI_AUTHORS__",     json.dumps(sorted(PI_AUTHOR_NAMES), ensure_ascii=False))
+    html = html.replace("__CLUSTER_COLORS__", json.dumps(CLUSTER_COLORS, ensure_ascii=False))
     OUT_PATH.write_text(html, encoding="utf-8")
     size_mb = OUT_PATH.stat().st_size / 1_048_576
     print(f"\n✓ Wrote {OUT_PATH}")
