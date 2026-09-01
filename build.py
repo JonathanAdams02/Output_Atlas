@@ -32,6 +32,23 @@ EMBED_MODEL      = "all-MiniLM-L6-v2"
 MIN_CLUSTER_SIZE = 15   # now actually wired into HDBSCAN below — lower = more, smaller clusters
 RANDOM_STATE     = 42
 
+# Set to True for verbose cluster-labeling debug output (tier used, top
+# candidates + scores considered at each stage, why earlier tiers were
+# skipped). Off by default since it's noisy for large runs.
+DEBUG_LABELS = True
+
+# How much a term's frequency in OTHER clusters penalizes it when scoring
+# cluster labels: score = freq_in_cluster / (freq_everywhere ** DISCRIMINATIVE_POWER + 1)
+#   1.0 = full c-TF-IDF discrimination (terms common lab-wide get buried,
+#         even if they're a big part of what a given cluster is about)
+#   0.0 = pure raw frequency within the cluster, cross-cluster spread ignored
+#         entirely (labels become "most talked about in this cluster",
+#         not "most distinctive to this cluster")
+# Lower this if recurring lab-wide themes (e.g. "social cognition") keep
+# losing out to rarer, noisier terms just because they're common everywhere.
+# 0.2–0.4 is a reasonable range to try if 0.7 feels too aggressive.
+DISCRIMINATIVE_POWER = 0.3
+
 # NOTE: this is the single source of truth for cluster colors — it gets
 # injected into the HTML template at build time (see write_atlas()).
 # Previously there was a *second*, hardcoded copy of this list inside the
@@ -465,7 +482,8 @@ document.getElementById('close-btn').addEventListener('click', () => {
       'display:none',
       'align-items:center',
       'gap:7px',
-      'z-index:3'
+      'z-index:3',
+      'transition:opacity .15s'
     ].join(';');
     d.innerHTML = `<span style="width:7px;height:7px;border-radius:50%;background:${c.color};flex:none;display:inline-block"></span>${c.name}`;
     wrap.appendChild(d);
@@ -587,16 +605,24 @@ document.getElementById('close-btn').addEventListener('click', () => {
 
   // ── Update point colours / sizes ──────────────────────────────────────────
   const noiseRgb = hexRgb(NOISE_COLOR);
+  // Which clusters currently have at least one paper matching the active
+  // filters (author/search/year/topic-toggle) — used to fade out cluster
+  // labels for topics the selected author (etc.) has nothing in, mirroring
+  // how the points themselves already dim when filtered out.
+  let activeClusterIds = new Set();
 
   function updatePoints() {
     updateCounts();
     const base = 1.0;
+    activeClusterIds = new Set();
     for (let i = 0; i < n; i++) {
       const p       = papers[i];
       const act     = active(p);
       const sel     = state.selected && state.selected._id === p._id;
       const hov     = state.hoverId === p._id;
       const isNoise = p.cluster === -1;
+
+      if (act && !isNoise) activeClusterIds.add(p.cluster);
 
       let r, g, b, a, s;
 
@@ -643,6 +669,7 @@ document.getElementById('close-btn').addEventListener('click', () => {
       el.style.display = 'flex';
       el.style.left = ((v.x * 0.5 + 0.5) * W) + 'px';
       el.style.top  = ((-v.y * 0.5 + 0.5) * H) + 'px';
+      el.style.opacity = activeClusterIds.has(c.id) ? '1' : '0.15';
     });
 
     renderer.render(scene, camera);
@@ -778,7 +805,14 @@ def build(papers):
 
     return papers
 
-def label_clusters(texts, labels, papers):
+def label_clusters(texts, labels, papers, debug=None):
+    if debug is None:
+        debug = DEBUG_LABELS
+
+    def dbg(msg):
+        if debug:
+            print(msg)
+
     groups = defaultdict(list)
     for i, (t, c) in enumerate(zip(texts, labels)):
         if c != -1:
@@ -788,92 +822,195 @@ def label_clusters(texts, labels, papers):
         "van", "de", "den", "der", "het", "een", "ter",
         "humans", "human", "adult", "adults", "female", "females",
         "male", "males", "aged", "child", "children", "animal",
-        "medicine", "psychology", "disease", "neuroscience",
+        "medicine", "psychology", "neuroscience",
         "health", "healthcare", "science", "clinical", "pathology",
         "psychiatry", "diagnosis", "prognosis", "treatment",
-        "patients", "research", "study", "methods", "results", "suicide"
+        "patients", "research", "study", "methods", "results", "suicide","tests", "processing", "assisted"
     }
 
+    # True filler/connector words only. Do NOT put clinically meaningful
     FUNCTION_WORDS = {
         "with", "without", "following", "after", "before", "during",
         "using", "among", "between", "within", "across", "versus",
         "into", "from", "than", "that", "this", "these", "those",
-        "which", "when", "where", "while", "variant", "primary",
-        "secondary", "major", "minor",
+        "which", "when", "where", "while"
     }
 
+    def term_words(term):
+        """Alphabetic word tokens in a term, ignoring commas/hyphens/parens/etc.
+        MeSH descriptors are often inverted with punctuation, e.g.
+        'Aphasia, Primary Progressive' or 'Dementia, Frontotemporal' —
+        punctuation shouldn't disqualify an otherwise clean term."""
+        return re.findall(r"[a-z]+", term.lower())
+
     def is_clean(term):
-        words = term.lower().split()
-        return (
-            all(w.isalpha() for w in words)
-            and not any(w in BLACKLIST for w in words)
-            and not any(w in FUNCTION_WORDS for w in words)
-            and len(term) > 4
-        )
+        words = term_words(term)
+        if not words:
+            return False  # nothing alphabetic at all (numeric code, junk, etc.)
+        if any(w in BLACKLIST for w in words):
+            return False
+        if any(w in FUNCTION_WORDS for w in words):
+            return False
+        if len(term.strip(" ,.-()")) <= 4:
+            return False
+        return True
+
+    def rejection_reason(term):
+        """Explain why a raw (pre-is_clean) term got filtered, for debugging."""
+        words = term_words(term)
+        if not words:
+            return "no alphabetic words"
+        hit = next((w for w in words if w in BLACKLIST), None)
+        if hit:
+            return f"blacklisted word '{hit}'"
+        hit = next((w for w in words if w in FUNCTION_WORDS), None)
+        if hit:
+            return f"function word '{hit}'"
+        if len(term.strip(" ,.-()")) <= 4:
+            return "too short (<=4 chars)"
+        return None
+
+    def pick_diverse(ranked_terms, term_paper_sets, k=2, overlap_threshold=0.55):
+        """Greedily pick up to k terms, best score first, but skip a term if
+        its set of tagged papers overlaps too heavily with a term already
+        picked (Jaccard similarity, or near-total containment). This is what
+        stops 'Frontotemporal Dementia' + 'Pick Disease Of The Brain' both
+        getting picked when they tag almost the same papers — the second
+        pick should describe a *different* part of the cluster, not the
+        same disease under another name."""
+        chosen, chosen_sets = [], []
+        skipped = []
+        for term in ranked_terms:
+            tset = term_paper_sets.get(term, set())
+            redundant_with = None
+            for prev_term, pset in zip(chosen, chosen_sets):
+                if not tset or not pset:
+                    continue
+                inter = len(tset & pset)
+                union = len(tset | pset)
+                jaccard = inter / union if union else 0.0
+                smaller = min(len(tset), len(pset))
+                containment = inter / smaller if smaller else 0.0
+                if jaccard >= overlap_threshold or containment >= 0.85:
+                    redundant_with = (prev_term, jaccard, containment)
+                    break
+            if redundant_with:
+                skipped.append((term, redundant_with))
+                continue
+            chosen.append(term)
+            chosen_sets.append(tset)
+            if len(chosen) >= k:
+                break
+        # If everything left was mutually redundant, fill remaining slots by
+        # score alone so we still return k labels rather than fewer.
+        if len(chosen) < k:
+            for term in ranked_terms:
+                if term not in chosen:
+                    chosen.append(term)
+                if len(chosen) >= k:
+                    break
+        if debug and skipped:
+            for term, (prev_term, jac, cont) in skipped:
+                dbg(f"      skip {term!r:35s} — overlaps with picked {prev_term!r} "
+                    f"(jaccard={jac:.2f}, containment={cont:.2f}) — same papers, different name")
+        return chosen[:k]
+
+    def dbg_candidates(label, raw_counts, scored, top_n=8):
+        """Print the top raw candidates for a tier, their score, and clean/reject status."""
+        if not debug or not raw_counts:
+            return
+        ranked_all = sorted(raw_counts, key=lambda k: -scored.get(k, 0))[:top_n]
+        dbg(f"    {label} candidates (top {len(ranked_all)} of {len(raw_counts)}):")
+        for term in ranked_all:
+            reason = rejection_reason(term)
+            status = "OK" if reason is None else f"REJECTED ({reason})"
+            dbg(f"      {term!r:40s} raw={raw_counts[term]:.1f}  score={scored.get(term, 0):.4f}  {status}")
 
     # ── pass 1: count MeSH per cluster and globally ──
-    mesh_per_cluster  = {}
-    total_mesh_counts = defaultdict(float)
+    mesh_per_cluster        = {}
+    mesh_papers_per_cluster = {}   # term -> set of paper indices tagged with it (for dedup)
+    total_mesh_counts       = defaultdict(float)
 
     for c, indices in groups.items():
-        counts = defaultdict(float)
+        counts       = defaultdict(float)
+        term_papers  = defaultdict(set)
         for i in indices:
             for term in papers[i].get("mesh", []):
-                if term and is_clean(term):
-                    counts[term.lower()] += 1.0
-                    total_mesh_counts[term.lower()] += 1.0
-        mesh_per_cluster[c] = counts
+                if term:
+                    t = term.lower()
+                    counts[t] += 1.0
+                    total_mesh_counts[t] += 1.0
+                    term_papers[t].add(i)
+        mesh_per_cluster[c]        = counts
+        mesh_papers_per_cluster[c] = term_papers
 
     # ── pass 2: score and label ──
     names = {-1: "Unclustered"}
     for c, indices in groups.items():
+        dbg(f"\n── cluster {c} (n={len(indices)}) ──")
         counts = mesh_per_cluster[c]
+        dbg(f"    {len(counts)} distinct raw MeSH terms found")
 
         # c-TF-IDF: freq in cluster / freq across all clusters
         scored = {
-            kw: freq / (total_mesh_counts[kw] ** 0.7 + 1)
+            kw: freq / (total_mesh_counts[kw] ** DISCRIMINATIVE_POWER + 1)
             for kw, freq in counts.items()
         }
-        ranked = sorted(scored, key=lambda k: -scored[k])[:2]
+        clean_scored = {k: v for k, v in scored.items() if is_clean(k)}
+        dbg_candidates("MeSH", counts, scored)
+        ranked_by_score = sorted(clean_scored, key=lambda k: -clean_scored[k])
+        ranked = pick_diverse(ranked_by_score, mesh_papers_per_cluster[c], k=2)
 
         if ranked:
             names[c] = " · ".join(k.title() for k in ranked)
             print(f"  cluster {c} (n={len(indices)}): {names[c]}  [mesh]")
             continue
 
+        dbg(f"    → no clean MeSH candidates, falling back to keywords/title-bigrams")
+
         # ── fallback 1: discriminative keywords + title bigrams ──
         kw_counts   = defaultdict(float)
         total_kw    = defaultdict(float)
+        kw_papers   = defaultdict(set)   # term -> set of paper indices (for dedup)
         for i in indices:
             for kw in papers[i].get("keywords", []):
-                if kw and is_clean(kw):
-                    kw_counts[kw.lower()] += 1.0
-                    total_kw[kw.lower()]  += 1.0
+                if kw:
+                    k_ = kw.lower()
+                    kw_counts[k_] += 1.0
+                    total_kw[k_]  += 1.0
+                    kw_papers[k_].add(i)
             title_words = papers[i].get("title", "").lower().split()
             for j in range(len(title_words) - 1):
                 bg = title_words[j] + " " + title_words[j+1]
-                if is_clean(bg) and all(len(w) > 3 for w in bg.split()):
+                if all(len(w) > 3 for w in bg.split()):
                     kw_counts[bg] += 0.4
                     total_kw[bg]  += 0.4
+                    kw_papers[bg].add(i)
 
         # build global totals for this fallback
         all_kw_total = defaultdict(float)
         for c2, idx2 in groups.items():
             for i in idx2:
                 for kw in papers[i].get("keywords", []):
-                    if kw and is_clean(kw):
+                    if kw:
                         all_kw_total[kw.lower()] += 1.0
 
         scored_kw = {
-            kw: freq / (all_kw_total[kw] ** 0.7 + 1)
+            kw: freq / (all_kw_total[kw] ** DISCRIMINATIVE_POWER + 1)
             for kw, freq in kw_counts.items()
         }
-        ranked_kw = sorted(scored_kw, key=lambda k: -scored_kw[k])[:2]
+        clean_scored_kw = {k: v for k, v in scored_kw.items() if is_clean(k)}
+        dbg(f"    {len(kw_counts)} distinct raw keyword/bigram candidates found")
+        dbg_candidates("keyword/bigram", kw_counts, scored_kw)
+        ranked_kw_by_score = sorted(clean_scored_kw, key=lambda k: -clean_scored_kw[k])
+        ranked_kw = pick_diverse(ranked_kw_by_score, kw_papers, k=2)
 
         if ranked_kw:
             names[c] = " · ".join(k.title() for k in ranked_kw)
             print(f"  cluster {c} (n={len(indices)}): {names[c]}  [keywords]")
             continue
+
+        dbg(f"    → no clean keyword/bigram candidates, falling back to TF-IDF on abstracts")
 
         # ── fallback 2: TF-IDF on abstracts ──
         cluster_texts = [texts[i] for i in indices]
@@ -882,10 +1019,31 @@ def label_clusters(texts, labels, papers):
         X      = tfidf.fit_transform(cluster_texts)
         scores = np.asarray(X.mean(axis=0)).ravel()
         terms  = np.array(tfidf.get_feature_names_out())
-        ranked_tf = [t for t in terms[scores.argsort()[::-1]]
-                     if is_clean(t)][:2]
+        order  = scores.argsort()[::-1]
+
+        if debug:
+            top = terms[order][:8]
+            top_scores = scores[order][:8]
+            dbg(f"    TF-IDF candidates (top {len(top)} of {len(terms)}):")
+            for term, sc in zip(top, top_scores):
+                reason = rejection_reason(term)
+                status = "OK" if reason is None else f"REJECTED ({reason})"
+                dbg(f"      {term!r:40s} tfidf={sc:.4f}  {status}")
+
+        # Build paper-index sets for the top clean candidates only (cheap:
+        # just which local docs have a nonzero entry in that column) so we
+        # can dedup near-synonym n-grams the same way as the other tiers.
+        clean_ranked_tf = [t for t in terms[order] if is_clean(t)][:15]
+        col_of = {t: i for i, t in enumerate(terms)}
+        tf_paper_sets = {}
+        for t in clean_ranked_tf:
+            rows = X[:, col_of[t]].nonzero()[0]
+            tf_paper_sets[t] = {indices[r] for r in rows}
+
+        ranked_tf = pick_diverse(clean_ranked_tf, tf_paper_sets, k=2)
         names[c] = " · ".join(t.title() for t in ranked_tf) if ranked_tf else f"Cluster {c}"
-        print(f"  cluster {c} (n={len(indices)}): {names[c]}  [tfidf]")
+        tier = "tfidf" if ranked_tf else "fallback (no clean terms at any tier)"
+        print(f"  cluster {c} (n={len(indices)}): {names[c]}  [{tier}]")
 
     return names
 
