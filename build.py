@@ -2,7 +2,9 @@
 """
 build.py — generate a self-contained atlas.html for the Research Atlas.
 
-Pipeline: fetch OpenAlex → embed → UMAP 3D → HDBSCAN → TF-IDF labels → write HTML
+Pipeline: fetch OpenAlex → fill missing abstracts from PubMed → embed
+          → UMAP 3D → HDBSCAN → place abstract-less papers by nearest
+          neighbours → label clusters → write HTML
 
 The output is a single atlas.html: plain HTML/CSS/JS with Three.js bundled inline.
 No server needed — just double-click to open.
@@ -16,20 +18,54 @@ import numpy as np
 from sentence_transformers import SentenceTransformer
 import umap
 import hdbscan
-from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.feature_extraction.text import TfidfVectorizer, ENGLISH_STOP_WORDS
 
 # ── CONFIG ────────────────────────────────────────────────────────────────────
 DIMS   = 3
 MAILTO = "jonathan.adams@kuleuven.be"
 
-AUTHOR_IDS     = ["A5052009397","A5073952660","A5046990645","A5062466055","A5009995930","A5004036435","A5037642793","A5087545626","a5004439858","a5029582591","a5118991313","a5075193529"]##Jan,matthieu, doga, maartem, louise, chi-hao, francois laurent, thomas, filip, marta bono, robbe decloedt, laurent mertens  # your PIs' OpenAlex author IDs
+AUTHOR_IDS     = ["A5052009397","A5073952660","A5046990645","A5062466055","A5009995930","A5004036435","A5037642793","A5087545626","a5004439858","a5029582591","a5118991313","a5075193529","A5085661145","A5015770306", "A5151211383" ]##Jan,matthieu, doga, maartem, louise, chi-hao,  francois laurent, thomas, filip, marta bono, robbe decloedt, laurent mertens,pascal sienaert, Margot van Cauwenberge, JOnathan Adams, Laura van Hove.  #OpenAlex author IDs
 
 INSTITUTION_ID = None
+
+# Authors stored per paper: the first MAX_AUTHORS, plus the last (senior)
+# author and any PI in between, so the author filter still finds them.
+MAX_AUTHORS = 8
+
+# ── Which works to leave out ──
+# OpenAlex work types to drop. Letters, editorials, reviews, book chapters
+# etc. are kept. "peer-review" = the "Author response for …" records.
+EXCLUDE_TYPES = {"peer-review", "erratum", "paratext", "retraction"}
+
+# Drop conference proceedings / meeting abstracts (see is_conference()).
+EXCLUDE_CONFERENCE = True
+
+# Many journals (notably Elsevier) don't share abstracts with OpenAlex. For
+# papers without one, look the abstract up on PubMed (by PMID, or by DOI).
+# Results are cached, so only new papers are looked up on later runs.
+# Delete pubmed_abstracts.json to look everything up again.
+USE_PUBMED   = True
+PUBMED_CACHE = Path(__file__).resolve().parent / "pubmed_abstracts.json"
+
+# ── Papers that still have no abstract (after PubMed) ──
+# Only these OpenAlex types are kept without an abstract; anything else
+# (book chapters, books, datasets, …) is only kept when it has an abstract.
+NO_ABSTRACT_KEEP_TYPES = {"article", "review", "letter"}
+
+# Abstract-less papers are not used to form clusters. Afterwards each one is
+# placed in the cluster of the most similar papers, compared on title +
+# keywords + topics + journal.
+ASSIGN_K       = 15     # how many nearest papers vote on the cluster
+MIN_ASSIGN_SIM = 0.35   # below this similarity to its nearest paper → left unclustered (grey)
+
+# How much an abstract-less paper counts when naming clusters, relative to a
+# paper with an abstract (1.0 = same weight, 0 = ignored).
+NO_ABSTRACT_WEIGHT = 0.3
 
 OUT_PATH = Path(__file__).resolve().parent / "atlas.html"
 
 EMBED_MODEL      = "all-MiniLM-L6-v2"
-MIN_CLUSTER_SIZE = 15   # now actually wired into HDBSCAN below — lower = more, smaller clusters
+MIN_CLUSTER_SIZE = 30   # now actually wired into HDBSCAN below — lower = more, smaller clusters
 RANDOM_STATE     = 42
 
 # Set to True for verbose cluster-labeling debug output (tier used, top
@@ -46,14 +82,10 @@ DEBUG_LABELS = True
 #         not "most distinctive to this cluster")
 # Lower this if recurring lab-wide themes (e.g. "social cognition") keep
 # losing out to rarer, noisier terms just because they're common everywhere.
-# 0.2–0.4 is a reasonable range to try if 0.7 feels too aggressive.
-DISCRIMINATIVE_POWER = 0.3
+DISCRIMINATIVE_POWER = 0.2
 
 # NOTE: this is the single source of truth for cluster colors — it gets
 # injected into the HTML template at build time (see write_atlas()).
-# Previously there was a *second*, hardcoded copy of this list inside the
-# JS template that actually controlled rendering, so editing this list did
-# nothing. That's fixed now: the JS reads __CLUSTER_COLORS__ instead.
 CLUSTER_COLORS = [
     '#c2613f', '#c0902e', '#5a9e57', '#2f9ea0',
     '#3f74c0', '#7b6bcf', '#b057a8', '#b8506b',
@@ -374,7 +406,7 @@ function showDetail(p) {
   document.getElementById('det-clname').textContent   = c ? c.name : 'Unclustered';
   document.getElementById('det-title').textContent    = p.title;
   document.getElementById('det-meta').textContent     = (p.authors || []).join(', ') + ' · ' + p.year;
-  document.getElementById('det-abstract').textContent = p.abstract || '';
+  document.getElementById('det-abstract').textContent = p.abstract || 'No abstract available.';
   document.getElementById('det-link').href            = p.url || '#';
   detailEl.classList.add('open');
   updatePoints();
@@ -682,12 +714,13 @@ document.getElementById('close-btn').addEventListener('click', () => {
 
 # ── FETCH ─────────────────────────────────────────────────────────────────────
 def openalex_filter():
+    # No has_abstract filter: papers without an abstract are fetched too, and
+    # placed in a cluster after clustering (assign_no_abstract).
     parts = []
     if AUTHOR_IDS:
         parts.append("authorships.author.id:" + "|".join(a.upper() for a in AUTHOR_IDS))
     if INSTITUTION_ID:
         parts.append("authorships.institutions.id:" + INSTITUTION_ID)
-    parts.append("has_abstract:true")
     return ",".join(parts)
 
 def fetch_openalex():
@@ -717,36 +750,193 @@ def abstract_from_inverted(inv):
             pos[i] = word
     return " ".join(pos[i] for i in sorted(pos))
 
+# Meeting-abstract codes at the start of a title, e.g. "P.2.c.007 ", "S.05.02 ",
+# "T128. ", "445. ", "P2-176 ", "P.0381 ", "Poster #M51 ".
+# Letter codes must contain a "." or "-" (so gene names like "CR1" don't match);
+# bare numbers need a trailing dot ("445.") or 3+ digits ("157").
+CONF_CODE = re.compile(
+    r"^(?:[Pp]oster\s*#?\s*\w+"
+    r"|[A-Z]{1,2}(?=[\w.\-]*[.\-])[\d.\-]*\d[a-z.\d\-]*\.?"
+    r"|\d+\."
+    r"|\d{3,})\s"
+)
+
+def is_conference(w, has_abstract):
+    """True for conference proceedings / meeting abstracts / posters."""
+    src = ((w.get("primary_location") or {}).get("source") or {})
+    if src.get("type") == "conference":
+        return True
+    if w.get("type_crossref") == "proceedings-article":
+        return True
+    # The title-code check only applies to works without an abstract: that's
+    # where supplement-printed meeting abstracts end up, and it avoids false
+    # hits on real papers whose title starts with a number ("12 weeks of …").
+    return not has_abstract and bool(CONF_CODE.match(w.get("title") or ""))
+
+def exclusion_reason(w, has_abstract):
+    if w.get("type") in EXCLUDE_TYPES:
+        return f"type {w.get('type')}"
+    if w.get("is_paratext"):
+        return "paratext"
+    if EXCLUDE_CONFERENCE and is_conference(w, has_abstract):
+        return "conference"
+    return None
+
 def normalize(works):
-    """Parse works and collect PI display names as a side-effect."""
+    """Parse works and collect PI display names as a side-effect.
+    Returns (papers_with_abstract, papers_without_abstract)."""
     pi_ids_upper = {a.upper() for a in AUTHOR_IDS}
-    out = []
+    out, no_abs = [], []
+    dropped = defaultdict(list)
     for w in works:
         ab = abstract_from_inverted(w.get("abstract_inverted_index"))
-        if not ab or len(ab) < 60:
+        reason = exclusion_reason(w, len(ab) >= 60)
+        if reason:
+            dropped[reason].append(f"{w['id'].split('/')[-1]}  {w.get('title') or '(untitled)'}")
             continue
-        for a in w.get("authorships", []):
-            aid = (a["author"].get("id") or "").split("/")[-1].upper()
-            if aid in pi_ids_upper:
-                PI_AUTHOR_NAMES.add(a["author"]["display_name"])
+        # Keep the first MAX_AUTHORS authors, the last (senior) author, and any
+        # PI in between. "…" marks where authors were left out.
+        authorships = w.get("authorships", [])
+        last = len(authorships) - 1
+        authors, prev = [], -1
+        for pos, a in enumerate(authorships):
+            name = a["author"]["display_name"]
+            aid  = (a["author"].get("id") or "").split("/")[-1].upper()
+            is_pi = aid in pi_ids_upper
+            if is_pi:
+                PI_AUTHOR_NAMES.add(name)
+            if pos < MAX_AUTHORS or pos == last or is_pi:
+                if pos > prev + 1:
+                    authors.append("…")
+                authors.append(name)
+                prev = pos
 
-        if not out:  # print first paper's raw keywords to inspect
+        if not out and not no_abs:  # print first paper's raw keywords to inspect
             print("keywords sample:", w.get("keywords", [])[:3])
             print("topics sample:",   w.get("topics",   [])[:3])
 
-        out.append({
+        rec = {
             "id":       w["id"].split("/")[-1],
             "title":    w.get("title") or "(untitled)",
             "year":     w.get("publication_year"),
-            "authors":  [auth["author"]["display_name"] for auth in w.get("authorships", [])[:8]],
-            "abstract": ab,
+            "authors":  authors,
+            "abstract": ab if len(ab) >= 60 else "",
             "url":      w.get("doi") or w["id"],
+            "pmid":     ((w.get("ids") or {}).get("pmid") or "").rstrip("/").split("/")[-1],
+            "type":     w.get("type") or "",
+            "venue":    (((w.get("primary_location") or {}).get("source") or {}).get("display_name") or ""),
             "keywords": [k.get("keyword") or k.get("display_name") or "" for k in w.get("keywords", []) if k],
             "mesh":     [m["descriptor_name"] for m in w.get("mesh", [])
                          if m.get("descriptor_name") and m.get("is_major_topic")],
             "topics":   [t["display_name"] for t in w.get("topics", [])[:3] if t.get("display_name")],
-        })
+        }
+        (out if rec["abstract"] else no_abs).append(rec)
+
+    print_dropped(dropped)
+    return out, no_abs
+
+def print_dropped(dropped):
+    if not dropped:
+        return
+    print(f"\nLeft out {sum(map(len, dropped.values()))} works:")
+    for reason, items in sorted(dropped.items()):
+        print(f"  {reason}: {len(items)}")
+        if DEBUG_LABELS:
+            for t in items:
+                print(f"      {t[:110]}")
+
+def keep_no_abstract(no_abs):
+    """After PubMed: keep only articles/letters without an abstract."""
+    keep, dropped = [], defaultdict(list)
+    for p in no_abs:
+        if p["type"] in NO_ABSTRACT_KEEP_TYPES:
+            keep.append(p)
+        else:
+            dropped[f"no abstract, type {p['type'] or 'unknown'}"].append(f"{p['id']}  {p['title']}")
+    print_dropped(dropped)
+    return keep
+
+# ── PUBMED FALLBACK FOR MISSING ABSTRACTS ─────────────────────────────────────
+EUTILS = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils"
+
+def parse_pubmed_xml(xml_bytes):
+    """PubMed efetch XML -> {pmid: abstract}. Structured abstracts keep their labels."""
+    import xml.etree.ElementTree as ET
+    out = {}
+    for art in ET.fromstring(xml_bytes).iter("PubmedArticle"):
+        pmid = (art.findtext("./MedlineCitation/PMID") or "").strip()
+        parts = []
+        for at in art.iter("AbstractText"):
+            text = " ".join("".join(at.itertext()).split())
+            if text:
+                label = at.get("Label")
+                parts.append(f"{label}: {text}" if label else text)
+        if pmid and parts:
+            out[pmid] = " ".join(parts)
     return out
+
+def fill_from_pubmed(no_abs):
+    """Look up abstracts on PubMed for papers OpenAlex has none for.
+    Returns (papers_now_with_abstract, papers_still_without)."""
+    cache = json.loads(PUBMED_CACHE.read_text(encoding="utf-8")) if PUBMED_CACHE.exists() else {}
+    todo  = [p for p in no_abs if p["id"] not in cache]
+
+    # 1) papers with only a DOI: find their PMID (one request each, NCBI allows ~3/s)
+    doi_only = [p for p in todo if not p.get("pmid") and p["url"].startswith("https://doi.org/")]
+    if doi_only:
+        print(f"\nLooking up {len(doi_only)} DOIs on PubMed…")
+    for n, p in enumerate(doi_only, 1):
+        doi = p["url"][len("https://doi.org/"):]
+        qs  = urllib.parse.urlencode({"db": "pubmed", "retmode": "json", "term": f"{doi}[doi]", "email": MAILTO})
+        try:
+            with urllib.request.urlopen(f"{EUTILS}/esearch.fcgi?{qs}", timeout=30) as r:
+                ids = json.load(r)["esearchresult"]["idlist"]
+        except Exception as e:
+            print(f"  {p['id']}: lookup failed ({e}), will retry next run")
+            ids = None
+        if ids is not None and len(ids) == 1:
+            p["pmid"] = ids[0]
+        elif ids is not None:
+            cache[p["id"]] = ""          # not on PubMed (or ambiguous): remember
+        if n % 50 == 0:
+            print(f"  {n}/{len(doi_only)}")
+        time.sleep(0.35)
+
+    # 2) fetch abstracts for all known PMIDs, 200 per request
+    by_pmid = {p["pmid"]: p for p in todo if p.get("pmid")}
+    pmids   = list(by_pmid)
+    if pmids:
+        print(f"Fetching {len(pmids)} abstracts from PubMed…")
+    for i in range(0, len(pmids), 200):
+        batch = pmids[i:i + 200]
+        data  = urllib.parse.urlencode({"db": "pubmed", "id": ",".join(batch),
+                                        "retmode": "xml", "email": MAILTO}).encode()
+        try:
+            with urllib.request.urlopen(f"{EUTILS}/efetch.fcgi", data=data, timeout=60) as r:
+                found = parse_pubmed_xml(r.read())
+        except Exception as e:
+            print(f"  batch {i // 200 + 1}: fetch failed ({e}), will retry next run")
+            continue
+        for pm in batch:
+            cache[by_pmid[pm]["id"]] = found.get(pm, "")
+        time.sleep(0.35)
+
+    # papers with no PMID and no DOI can't be looked up: remember that too
+    for p in todo:
+        if not p.get("pmid") and not p["url"].startswith("https://doi.org/"):
+            cache.setdefault(p["id"], "")
+
+    PUBMED_CACHE.write_text(json.dumps(cache, indent=1, ensure_ascii=False), encoding="utf-8")
+
+    now_with, still_without = [], []
+    for p in no_abs:
+        ab = cache.get(p["id"], "")
+        if len(ab) >= 60:
+            p["abstract"] = ab
+            now_with.append(p)
+        else:
+            still_without.append(p)
+    return now_with, still_without
 
 # ── EMBED / CLUSTER ───────────────────────────────────────────────────────────
 def build(papers):
@@ -788,26 +978,107 @@ def build(papers):
         print(f"  NOTE: {n_clusters} clusters but only {len(CLUSTER_COLORS)} colors defined — "
               f"colors will repeat (cluster id % {len(CLUSTER_COLORS)}). Add more to CLUSTER_COLORS if you want every cluster visually distinct.")
 
-    names = label_clusters(texts, labels, papers)
-
     # Normalise coords to roughly [-5, 5]
     coords -= coords.mean(axis=0)
     coords /= (np.abs(coords).max() + 1e-9) / 5.0
 
     for i, p in enumerate(papers):
-        c = int(labels[i])
-        p["cluster"]      = c
-        p["clusterLabel"] = names.get(c, "Unclustered")
-        p["x"] = round(float(coords[i][0]), 4)
-        p["y"] = round(float(coords[i][1]), 4)
-        if DIMS == 3:
-            p["z"] = round(float(coords[i][2]), 4)
+        p["cluster"] = int(labels[i])
+        p["_text"]   = texts[i]
+        p["_weight"] = 1.0
+        for a, v in zip(["x", "y", "z"][:DIMS], coords[i]):
+            p[a] = round(float(v), 4)
 
+    return papers, model, vecs, labels, coords
+
+def meta_text(p):
+    """Text for a paper without abstract: title + keywords + topics + MeSH + journal."""
+    extra = list(dict.fromkeys(e for e in p.get("keywords", []) + p.get("topics", []) + p.get("mesh", []) if e))
+    parts = [p["title"]]
+    if extra:
+        parts.append("; ".join(extra))
+    if p.get("venue"):
+        parts.append(p["venue"])
+    return ". ".join(parts)
+
+def assign_no_abstract(papers, no_abs, model, vecs, labels, coords):
+    """Place each abstract-less paper in the cluster its nearest neighbours
+    (among papers with an abstract) belong to, and position it among them."""
+    if not no_abs:
+        return []
+    texts = [meta_text(p) for p in no_abs]
+    nvecs = model.encode(texts, show_progress_bar=False, normalize_embeddings=True)
+    sims  = nvecs @ vecs.T
+    k     = min(ASSIGN_K, len(papers))
+    rng   = np.random.default_rng(RANDOM_STATE)
+    spread = coords.std(axis=0) * 0.03   # small jitter so points don't stack
+
+    per_cluster, unclustered = defaultdict(int), []
+    for p, text, row in zip(no_abs, texts, sims):
+        nn   = np.argsort(-row)[:k]
+        top  = float(row[nn[0]])
+        votes = defaultdict(float)
+        for j in nn:
+            votes[int(labels[j])] += float(row[j])
+        cl = max(votes, key=votes.get)
+        if top < MIN_ASSIGN_SIM:
+            cl = -1
+        # position: similarity-weighted mean of the neighbours in that cluster
+        members = [j for j in nn if cl == -1 or int(labels[j]) == cl]
+        w   = np.array([max(float(row[j]), 1e-6) for j in members])
+        xyz = (coords[members] * w[:, None]).sum(axis=0) / w.sum() + rng.normal(0, 1, DIMS) * spread
+
+        p["cluster"] = cl
+        p["_text"]   = text
+        p["_weight"] = NO_ABSTRACT_WEIGHT
+        for a, v in zip(["x", "y", "z"][:DIMS], xyz):
+            p[a] = round(float(v), 4)
+        if cl == -1:
+            unclustered.append((top, p))
+        else:
+            per_cluster[cl] += 1
+
+    print(f"\nPlaced {len(no_abs)} papers without abstract: "
+          f"{sum(per_cluster.values())} in clusters, {len(unclustered)} left unclustered.")
+    if unclustered:
+        print(f"  Unclustered (nearest similarity < {MIN_ASSIGN_SIM}):")
+        for top, p in sorted(unclustered, key=lambda t: t[0]):
+            print(f"    {p['id']}  ({top:.2f})  {p['title'][:90]}")
+    return no_abs
+
+def apply_names(papers):
+    names = label_clusters([p["_text"] for p in papers],
+                           np.array([p["cluster"] for p in papers]),
+                           papers,
+                           weights=[p["_weight"] for p in papers])
+    for p in papers:
+        p["clusterLabel"] = names.get(p["cluster"], "Unclustered")
+        for k in ("_text", "_weight", "pmid", "type"):
+            p.pop(k, None)
     return papers
 
-def label_clusters(texts, labels, papers, debug=None):
+def label_clusters(texts, labels, papers, weights=None, debug=None):
+    """Name clusters. `weights` sets how much each paper counts (papers
+    without abstract count NO_ABSTRACT_WEIGHT, the rest 1.0)."""
     if debug is None:
         debug = DEBUG_LABELS
+    if weights is None:
+        weights = [1.0] * len(papers)
+
+    # Original casing for display ("ECT", "fMRI", "C9orf72"), keyed by lowercase
+    display = {}
+    def remember(original):
+        display.setdefault(original.lower(), original)
+        return original.lower()
+
+    def pretty(term):
+        words = display.get(term, term).split()
+        out = []
+        for w in words:
+            keep = (w.isupper() and len(w) <= 5) or any(c.isupper() for c in w[1:]) and not w.isupper() \
+                   or any(c.isdigit() for c in w)
+            out.append(w if keep else w[:1].upper() + w[1:].lower())
+        return " ".join(out)
 
     def dbg(msg):
         if debug:
@@ -825,7 +1096,7 @@ def label_clusters(texts, labels, papers, debug=None):
         "medicine", "psychology", "neuroscience",
         "health", "healthcare", "science", "clinical", "pathology",
         "psychiatry", "diagnosis", "prognosis", "treatment",
-        "patients", "research", "study", "methods", "results", "suicide","tests", "processing", "assisted"
+        "patients", "research", "study", "methods", "results","tests", "processing", "assisted"
     }
 
     # True filler/connector words only. Do NOT put clinically meaningful
@@ -851,8 +1122,6 @@ def label_clusters(texts, labels, papers, debug=None):
             return False
         if any(w in FUNCTION_WORDS for w in words):
             return False
-        if len(term.strip(" ,.-()")) <= 4:
-            return False
         return True
 
     def rejection_reason(term):
@@ -866,8 +1135,6 @@ def label_clusters(texts, labels, papers, debug=None):
         hit = next((w for w in words if w in FUNCTION_WORDS), None)
         if hit:
             return f"function word '{hit}'"
-        if len(term.strip(" ,.-()")) <= 4:
-            return "too short (<=4 chars)"
         return None
 
     def pick_diverse(ranked_terms, term_paper_sets, k=2, overlap_threshold=0.55):
@@ -926,6 +1193,21 @@ def label_clusters(texts, labels, papers, debug=None):
             status = "OK" if reason is None else f"REJECTED ({reason})"
             dbg(f"      {term!r:40s} raw={raw_counts[term]:.1f}  score={scored.get(term, 0):.4f}  {status}")
 
+    def kw_terms(i):
+        """(term, weight) pairs for the keyword tier: OpenAlex keywords, plus
+        title word-pairs at 0.4 that skip common English words (no length
+        minimum, so acronyms like "ECT" or "PET" can appear)."""
+        out = []
+        for kw in papers[i].get("keywords", []):
+            if kw:
+                out.append((remember(kw), weights[i]))
+        words = re.findall(r"[A-Za-z][\w\-]*", papers[i].get("title", ""))
+        for w1, w2 in zip(words, words[1:]):
+            if w1.lower() in ENGLISH_STOP_WORDS or w2.lower() in ENGLISH_STOP_WORDS:
+                continue
+            out.append((remember(f"{w1} {w2}"), 0.4 * weights[i]))
+        return out
+
     # ── pass 1: count MeSH per cluster and globally ──
     mesh_per_cluster        = {}
     mesh_papers_per_cluster = {}   # term -> set of paper indices tagged with it (for dedup)
@@ -937,9 +1219,9 @@ def label_clusters(texts, labels, papers, debug=None):
         for i in indices:
             for term in papers[i].get("mesh", []):
                 if term:
-                    t = term.lower()
-                    counts[t] += 1.0
-                    total_mesh_counts[t] += 1.0
+                    t = remember(term)
+                    counts[t] += weights[i]
+                    total_mesh_counts[t] += weights[i]
                     term_papers[t].add(i)
         mesh_per_cluster[c]        = counts
         mesh_papers_per_cluster[c] = term_papers
@@ -962,7 +1244,7 @@ def label_clusters(texts, labels, papers, debug=None):
         ranked = pick_diverse(ranked_by_score, mesh_papers_per_cluster[c], k=2)
 
         if ranked:
-            names[c] = " · ".join(k.title() for k in ranked)
+            names[c] = " · ".join(pretty(k) for k in ranked)
             print(f"  cluster {c} (n={len(indices)}): {names[c]}  [mesh]")
             continue
 
@@ -970,30 +1252,19 @@ def label_clusters(texts, labels, papers, debug=None):
 
         # ── fallback 1: discriminative keywords + title bigrams ──
         kw_counts   = defaultdict(float)
-        total_kw    = defaultdict(float)
         kw_papers   = defaultdict(set)   # term -> set of paper indices (for dedup)
         for i in indices:
-            for kw in papers[i].get("keywords", []):
-                if kw:
-                    k_ = kw.lower()
-                    kw_counts[k_] += 1.0
-                    total_kw[k_]  += 1.0
-                    kw_papers[k_].add(i)
-            title_words = papers[i].get("title", "").lower().split()
-            for j in range(len(title_words) - 1):
-                bg = title_words[j] + " " + title_words[j+1]
-                if all(len(w) > 3 for w in bg.split()):
-                    kw_counts[bg] += 0.4
-                    total_kw[bg]  += 0.4
-                    kw_papers[bg].add(i)
+            for term, w in kw_terms(i):
+                kw_counts[term] += w
+                kw_papers[term].add(i)
 
-        # build global totals for this fallback
+        # global totals (keywords AND bigrams) across all clusters, so terms
+        # common to the whole lab are penalised the same way as in the MeSH tier
         all_kw_total = defaultdict(float)
-        for c2, idx2 in groups.items():
+        for idx2 in groups.values():
             for i in idx2:
-                for kw in papers[i].get("keywords", []):
-                    if kw:
-                        all_kw_total[kw.lower()] += 1.0
+                for term, w in kw_terms(i):
+                    all_kw_total[term] += w
 
         scored_kw = {
             kw: freq / (all_kw_total[kw] ** DISCRIMINATIVE_POWER + 1)
@@ -1006,7 +1277,7 @@ def label_clusters(texts, labels, papers, debug=None):
         ranked_kw = pick_diverse(ranked_kw_by_score, kw_papers, k=2)
 
         if ranked_kw:
-            names[c] = " · ".join(k.title() for k in ranked_kw)
+            names[c] = " · ".join(pretty(k) for k in ranked_kw)
             print(f"  cluster {c} (n={len(indices)}): {names[c]}  [keywords]")
             continue
 
@@ -1017,7 +1288,8 @@ def label_clusters(texts, labels, papers, debug=None):
         tfidf  = TfidfVectorizer(stop_words="english", max_features=2000,
                                  ngram_range=(2, 3), sublinear_tf=True)
         X      = tfidf.fit_transform(cluster_texts)
-        scores = np.asarray(X.mean(axis=0)).ravel()
+        wvec   = np.array([weights[i] for i in indices])
+        scores = np.asarray(X.T @ wvec).ravel() / max(wvec.sum(), 1e-9)
         terms  = np.array(tfidf.get_feature_names_out())
         order  = scores.argsort()[::-1]
 
@@ -1041,7 +1313,7 @@ def label_clusters(texts, labels, papers, debug=None):
             tf_paper_sets[t] = {indices[r] for r in rows}
 
         ranked_tf = pick_diverse(clean_ranked_tf, tf_paper_sets, k=2)
-        names[c] = " · ".join(t.title() for t in ranked_tf) if ranked_tf else f"Cluster {c}"
+        names[c] = " · ".join(pretty(t) for t in ranked_tf) if ranked_tf else f"Cluster {c}"
         tier = "tfidf" if ranked_tf else "fallback (no clean terms at any tier)"
         print(f"  cluster {c} (n={len(indices)}): {names[c]}  [{tier}]")
 
@@ -1068,9 +1340,17 @@ if __name__ == "__main__":
 
     print("\nFetching from OpenAlex…")
     raw_works = fetch_openalex()
-    papers    = normalize(raw_works)
-    print(f"{len(papers)} papers with usable abstracts.")
+    papers, no_abs = normalize(raw_works)
+    print(f"{len(papers)} papers with usable abstracts, {len(no_abs)} without.")
+    if USE_PUBMED and no_abs:
+        found, no_abs = fill_from_pubmed(no_abs)
+        papers += found
+        print(f"PubMed supplied {len(found)} abstracts: now {len(papers)} with, {len(no_abs)} without.")
+    no_abs = keep_no_abstract(no_abs)
+    print(f"Keeping {len(no_abs)} articles/letters without abstract.")
     print(f"{len(PI_AUTHOR_NAMES)} PI author names collected: {sorted(PI_AUTHOR_NAMES)}")
 
-    papers = build(papers)
+    papers, model, vecs, labels, coords = build(papers)
+    papers += assign_no_abstract(papers, no_abs, model, vecs, labels, coords)
+    papers  = apply_names(papers)
     write_atlas(papers, three_js, orbit_js)
